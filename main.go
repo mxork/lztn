@@ -3,74 +3,74 @@ package main
 import (
 	"bufio"
 	"fmt"
+	fftw "github.com/runningwild/go-fftw/fftw32"
+	"math"
 	"os"
 	"os/exec"
 	"time"
 )
 
+var _ = fftw.FFT
 var _ = exec.Command
+var _ = os.Stdin
+var _ = time.Now
 
-func isLong(d time.Duration) bool {
-	return (d > 600*time.Millisecond && d < 1000*time.Millisecond )
-}
-
-func isShort(d time.Duration) bool {
-	return (d < 600*time.Millisecond && d > 100*time.Millisecond)
-}
-
-func check(stack []time.Time) bool {
-	a, b, c := stack[0], stack[1], stack[2]
-	ps, os := a.Sub(b), b.Sub(c)
-	fmt.Println(ps)
-	return isShort(ps) && isShort(os)
-}
-
-func push(stack []time.Time, t time.Time) {
-	for i := len(stack)-2; i>=0; i-- {
-		stack[i+1] = stack[i]
+func maxmin(b []byte) (max, min int) {
+	max, min = 0, 255
+	for i := 0; i < len(b); i++ {
+		if int(b[i]) > max {
+			max = int(b[i])
+		}
+		if int(b[i]) < min {
+			min = int(b[i])
+		}
 	}
-	stack[0] = t
+
+	return
 }
+
+//dummy 1000hz generator
+type dummy struct {
+	c float64
+}
+
+func (d dummy) Read(b []byte) (n int, err error) {
+	freq := 1000.0
+	for i := range b {
+		b[i] = byte(127*math.Sin(2*math.Pi*freq*float64(d.c)/SAMP) + 128)
+		d.c += 1
+	}
+
+	return len(b), nil
+}
+
+const SAMP = 44100
+const SMPI = 1 / 44100
+const N = 2 << 14
 
 func main() {
-	var state bool
-	stack := make([]time.Time, 3) // actually, a queue
-	bf := bufio.NewReaderSize(os.Stdin, 32000)
-	b := make([]byte, 16000) // one or two seconds
+	bf := bufio.NewReaderSize(os.Stdin, SAMP) // one sec
+	b := make([]byte, N)
+	in := fftw.NewArray(N)
+	out := fftw.NewArray(N)
+	plan := fftw.NewPlan(in, out, fftw.Forward, fftw.DefaultFlag)
 
-	for now := range time.Tick(20 * time.Millisecond) { // 50Hz...
-		max, min := 0, 255
-
+	for _ = range time.Tick(500 * time.Millisecond) {
 		n, err := bf.Read(b)
-		if err != nil {
+		if err != nil || n != len(b) {
 			fmt.Println(err)
-			return
 		}
 
-		for i := 0; i < n; i++ {
-			if int(b[i]) > max { max = int(b[i]) }
-			if int(b[i]) < min { min = int(b[i]) }
+		for i, v := range b {
+			in.Elems[i] = complex((float32(v)-128)/127, 0)
 		}
 
-		amp := max-min
-
-		if amp > 150 && !state{ //enforce pause
-			state = true
-			push(stack, now)
-			if check(stack) {
-				fmt.Println("\n**BEAT**\n")
-				if len(os.Args) == 2 {
-					go func() {
-						cmd := exec.Command(os.Args[1])
-						out, err := cmd.Output()
-						if err != nil { fmt.Println(err) }
-						fmt.Println(string(out))
-					}()
-				}
-			}
-		} else {
-			state = false
+		plan.Execute()
+		for i, v := range out.Elems {
+			fmt.Println(float64(i)*SAMP/N, real(v*complex(real(v), -imag(v))))
 		}
+
+		bf.Reset(os.Stdin)
 	}
 
 }
