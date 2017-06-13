@@ -1,0 +1,9 @@
+Lztn
+====
+
+Command line app which reads audio data from stdin (piping, for example,
+from `arecord`), performs a short-time Fourier Transform, and executes a
+shell command if a particular frequency signature is present.
+
+TL;DR: I can control `mpd` by whistling at my laptop.
+
