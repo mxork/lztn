@@ -2,136 +2,128 @@ package main
 
 import (
 	"bufio"
-	"fmt"
-	fftw "github.com/runningwild/go-fftw/fftw32"
+	"github.com/mxork/lztn/overlap"
 	"math"
 	"os"
-	"os/exec"
 	"time"
+	//"os/exec"
+	nc "code.google.com/p/goncurses"
+	"errs"
+	"github.com/mxork/rbuf"
+	fftw "github.com/runningwild/go-fftw/fftw32"
+	"io"
 )
 
-var _ = fmt.Println
-var _ = fftw.FFT
-var _ = exec.Command
-var _ = os.Stdin
 var _ = time.Now
 
-func maxmin(b []byte) (max, min int) {
-	max, min = 0, 255
-	for i := 0; i < len(b); i++ {
-		if int(b[i]) > max {
-			max = int(b[i])
-		}
-		if int(b[i]) < min {
-			min = int(b[i])
-		}
-	}
-
-	return
-}
-
-func maxfreq(nrml []float64) (max, f float64) {
-	max, mi := 0, 0
-	off := 10
-	for i, v := range nrml[off : len(nrml)/2] {
-		if v > max {
-			max = v
-			mi = i
-		}
-	}
-
-	f = float64(mi+off) * SAMP / N
-	return
-}
-
-//dummy 1000hz generator
-type dummy struct {
-	c float64
-}
-
-func (d dummy) Read(b []byte) (n int, err error) {
-	freq := 1000.0
-	for i := range b {
-		b[i] = byte(127*math.Sin(2*math.Pi*freq*float64(d.c)/SAMP) + 128)
-		d.c += 1
-	}
-
-	return len(b), nil
-}
-
-// actually, modulus squared
-func modulus(x complex64) float64 {
-	return math.Sqrt(float64(real(x * complex(real(x), -imag(x)))))
-}
-
-// toss out the first few, and the top half
-func maxminc(s []complex64) (max, min float64, maxi, mini int) {
-	max, min = 0, math.MaxFloat64
-	for i, x := range s[20 : len(s)/2] {
-		v := modulus(x)
-		if v > max {
-			max, maxi = v, i
-		}
-		if v < min {
-			min, mini = v, i
-		}
-	}
-	return
-}
-
-func binf(i int) float64 {
-	return float64(i) * SAMP / N
-}
-
-func fbin(f float64) int {
-	return int(f * N / SAMP)
-}
+var xk = errs.Xk
 
 var SAMP = 44100.0
 
-const N = 2 << 13
-
 func main() {
-	bf := bufio.NewReaderSize(os.Stdin, int(SAMP)) // one sec
-	b := make([]byte, N)
+	// ncurses
+	win, err := nc.Init()
+	xk(err)
+	defer nc.End()
+
+	//nc.Cursor(0)
+	//nc.Echo(false)
+	//nc.CBreak(true)
+
+	//
+	bf := bufio.NewReaderSize(os.Stdin, CONSUME)
+
+	// init various result arrays
+	// two buffers to increase accuracy while decreasing latency
+	rb := rbuf.New(BUF_SIZE)
+
+	nrml := make([]float64, N)
+	spec := make([]float64, SEMI_N)
+
+	//fftw
 	in := fftw.NewArray(N)
 	out := fftw.NewArray(N)
-	nrml := make([]float64, N)
 	plan := fftw.NewPlan(in, out, fftw.Forward, fftw.DefaultFlag)
+	defer plan.Destroy()
 
-	avg := 100.0
-	last := time.Now()
+	//fill it up once
+	_, err = io.CopyN(rb, bf, BUF_SIZE)
+	xk(err)
 
-	for _ = range time.Tick(500 * time.Millisecond) {
-		n, err := bf.Read(b)
-		if err != nil || n != len(b) {
-			fmt.Println(err)
-		}
+	for cnt := 0; ; cnt++ {
+		rb.Consume(CONSUME)
+		_, err = io.CopyN(rb, bf, CONSUME)
+		xk(err)
 
-		for i, v := range b {
-			in.Elems[i] = complex((float32(v)-128)/127, 0)
+		// convert and transform
+		// if go-fftw32 supported real-only transforms,
+		// I could avoid the copy and not use a ring
+		// buffer
+		elems := in.Elems
+		for _, buf := range rb.AsSlice() {
+			fs := overlap.Bytes(buf).FloatSlice()
+			for j, v := range fs {
+				elems[j] = complex(v, 0)
+			}
+			elems = elems[len(fs):] // offset
 		}
 
 		plan.Execute()
 
+		// normalize
 		for i, v := range out.Elems {
 			nrml[i] = modulus(v) / math.Sqrt(N)
 		}
 
-		sum := 0.0
-		for _, v := range nrml[fbin(1100):fbin(1300)] {
-			sum += v
-		}
-		if sum > 10*avg && time.Since(last).Seconds() > 5 {
-			fmt.Println(sum, avg)
-			if len(os.Args) == 2 {
-				exec.Command(os.Args[1]).Run()
+		// histogram calc
+		max, maxf, maxfi := 0.0, 0.0, 0
+		for fi, f := range midnotes {
+
+			if fi == len(midnotes)-1 {
+				break
+			}
+
+			bf, tf := f, midnotes[fi+1]
+			//tighten it up a little
+			Δ := tf - bf
+			bf, tf = bf+Δ/4, tf-Δ/4
+			bi, ti := fbin(bf), fbin(tf)
+
+			sum := add(nrml[bi:ti]...)
+
+			spec[fi] = sum / float64(ti-bi)
+			if spec[fi] > max {
+				max, maxf, maxfi = spec[fi], (tf+bf)/2, fi
 			}
 		}
 
-		avg = (avg + sum) / 2
+		// display
+		win.Erase()
+		for i, vol := range spec {
+			x := i + i/12
+			win.MovePrint(0, x, noteName(i))
+			win.MovePrint(1, x, "-")
 
+			for j, a := 2, vol; a > 0 && j < 20; j, a = j+1, a-0.05 {
+				win.MovePrint(j, x, ".")
+			}
+		}
+
+		//supplemental info
+		my, mx := win.MaxYX()
+		win.MovePrint(my-10, mx-10, cnt)
+		win.MovePrint(my-8, 0, maxf)
+		win.MovePrint(my-7, 0, noteName(maxfi))
+
+		if maxf > 1000 && maxf < 1300 {
+			win.MovePrint(my-5, 0, "BANG")
+		}
+
+		win.NoutRefresh()
+
+		xk(nc.Update())
+
+		// stay up to date
 		bf.Reset(os.Stdin)
 	}
-
 }
